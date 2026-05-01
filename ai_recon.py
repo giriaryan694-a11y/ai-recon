@@ -1465,6 +1465,13 @@ def expand_targets(target_str: str, max_cidr: int = DEFAULT_MAX_CIDR) -> list[st
 def main():
     args = parse_args()
 
+    # Suppress InsecureRequestWarning only when the user explicitly opts out of
+    # TLS verification. When verify=True (the default), requests' warnings are
+    # left intact so legitimate cert errors aren't silently swallowed.
+    if args.no_verify:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
     if not args.no_banner:
         print_banner()
 
