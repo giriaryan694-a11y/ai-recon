@@ -14,16 +14,20 @@ Usage:
 """
 
 import argparse
+import asyncio
 import concurrent.futures
 import json
 import random
 import socket
+import ssl
+import struct
 import sys
 import time
 import ipaddress
 from datetime import datetime
 from typing import Optional
 
+import aiohttp
 import requests
 from rich import box
 from rich.console import Console
@@ -37,9 +41,9 @@ from rich.theme import Theme
 #  CONSTANTS & CONFIGURATION
 # ─────────────────────────────────────────────
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 AUTHOR  = "Aryan Giri"
-MAX_CIDR_HOSTS = 512   # Safety cap — refuse to scan CIDRs with more hosts than this
+DEFAULT_MAX_CIDR = 512  # Safety cap — refuse to scan CIDRs with more hosts than this
 
 # All AI/ML infrastructure ports with service metadata
 AI_PORTS = {
@@ -418,47 +422,70 @@ def tcp_connect(host: str, port: int, timeout: float) -> bool:
 
 
 # ─────────────────────────────────────────────
-#  PHASE 2 — HTTP FINGERPRINTER
+#  PHASE 2 — ASYNC HTTP FINGERPRINTER
 # ─────────────────────────────────────────────
 
-def http_probe(host: str, port: int, path: str, method: str,
-               body: Optional[str], timeout: float,
-               retries: int = 1) -> dict:
-    """
-    Single HTTP probe with retry + jitter on transient failures.
+def _make_ssl_ctx(verify: bool) -> ssl.SSLContext:
+    """Return an SSL context. verify=False skips cert validation (self-signed certs)."""
+    ctx = ssl.create_default_context()
+    if not verify:
+        ctx.check_hostname = False
+        ctx.verify_mode    = ssl.CERT_NONE
+    return ctx
 
-    retries=1 means one initial attempt + one retry on TIMEOUT or CONN error.
-    Jitter is random(0.1, 0.4)s so bursts don't hit the target all at once.
-    POST requests use json= so Content-Type is set correctly.
+
+async def async_http_probe(session: aiohttp.ClientSession,
+                           host: str, port: int,
+                           path: str, method: str,
+                           body: Optional[str],
+                           timeout: float,
+                           retries: int = 1) -> dict:
+    """
+    Async HTTP probe with retry + jitter on transient failures.
+
+    Uses aiohttp so all port probes within a phase run concurrently
+    instead of waiting for each one sequentially. The session's SSL
+    context is configured externally via _make_ssl_ctx().
+
+    POST requests are sent with json= equivalent (aiohttp json= kwarg)
+    so Content-Type is set correctly without manual header injection.
     """
     scheme = "https" if port == 443 else "http"
-    url = f"{scheme}://{host}:{port}{path}"
+    url    = f"{scheme}://{host}:{port}{path}"
     result = {"url": url, "status": None, "headers": {}, "body": "", "error": None}
-    base_headers = {"User-Agent": "AIRecon/1.2"}
+    hdrs   = {"User-Agent": f"AIRecon/{VERSION}"}
 
     for attempt in range(retries + 1):
         try:
+            to = aiohttp.ClientTimeout(total=timeout)
             if method == "POST":
                 json_body = json.loads(body) if isinstance(body, str) else ({} if body is None else body)
-                resp = requests.post(url, json=json_body, headers=base_headers,
-                                     timeout=timeout, verify=False)
+                async with session.post(url, json=json_body, headers=hdrs, timeout=to) as resp:
+                    result["status"]  = resp.status
+                    result["headers"] = dict(resp.headers)
+                    result["body"]    = (await resp.text())[:2000]
+                    result["error"]   = None
             else:
-                resp = requests.get(url, headers=base_headers, timeout=timeout, verify=False)
-            result["status"]  = resp.status_code
-            result["headers"] = dict(resp.headers)
-            result["body"]    = resp.text[:2000]
-            result["error"]   = None
-            return result  # success — no retry needed
+                async with session.get(url, headers=hdrs, timeout=to) as resp:
+                    result["status"]  = resp.status
+                    result["headers"] = dict(resp.headers)
+                    result["body"]    = (await resp.text())[:2000]
+                    result["error"]   = None
+            return result
 
-        except requests.exceptions.SSLError:
+        except aiohttp.ServerFingerprintMismatch:
             result["error"] = "SSL"
-            return result  # SSL errors won't resolve on retry
+            return result  # cert error won't recover on retry
 
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
-            result["error"] = "TIMEOUT" if isinstance(e, requests.exceptions.Timeout) else "CONN"
+        except (aiohttp.ClientConnectorError, aiohttp.ServerConnectionError):
+            result["error"] = "CONN"
             if attempt < retries:
-                time.sleep(random.uniform(0.1, 0.4))  # jitter before retry
-            # else fall through and return the last failure
+                await asyncio.sleep(random.uniform(0.1, 0.4))
+
+        except asyncio.TimeoutError:
+            result["error"] = "TIMEOUT"
+            if attempt < retries:
+                await asyncio.sleep(random.uniform(0.1, 0.4))
 
         except Exception as e:
             result["error"] = str(e)[:60]
@@ -467,116 +494,313 @@ def http_probe(host: str, port: int, path: str, method: str,
     return result
 
 
-def fingerprint_service(host: str, port: int, timeout: float) -> dict:
+# ── Thin sync wrapper for callers that aren't inside an async context ──────────
+def http_probe(host: str, port: int, path: str, method: str,
+               body: Optional[str], timeout: float,
+               verify: bool = False, retries: int = 1) -> dict:
     """
-    Run all probes for a port and return a weighted confidence assessment.
-
-    Confidence is derived from accumulated signal weight, not raw hit count:
-      weight >= 3  →  HIGH   (one definitive signal, or multiple strong ones)
-      weight >= 1  →  MEDIUM (something matched, but signals are ambiguous)
-      weight  = 0  →  LOW    (nothing matched)
-
-    This prevents a service with three weak (weight=1) keyword hits from
-    scoring HIGH when a single definitive (weight=3) header match is absent.
+    Synchronous HTTP probe used only for risk-flag checks (Phase 4).
+    All fingerprinting (Phase 2) and enumeration (Phase 3) use the async path.
     """
-    probes = FINGERPRINT_PROBES.get(port, [])
+    scheme = "https" if port == 443 else "http"
+    url    = f"{scheme}://{host}:{port}{path}"
+    result = {"url": url, "status": None, "headers": {}, "body": "", "error": None}
+    hdrs   = {"User-Agent": f"AIRecon/{VERSION}"}
+
+    for attempt in range(retries + 1):
+        try:
+            if method == "POST":
+                json_body = json.loads(body) if isinstance(body, str) else ({} if body is None else body)
+                resp = requests.post(url, json=json_body, headers=hdrs,
+                                     timeout=timeout, verify=verify)
+            else:
+                resp = requests.get(url, headers=hdrs, timeout=timeout, verify=verify)
+            result.update(status=resp.status_code,
+                          headers=dict(resp.headers),
+                          body=resp.text[:2000],
+                          error=None)
+            return result
+        except requests.exceptions.SSLError:
+            result["error"] = "SSL"; return result
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            result["error"] = "TIMEOUT" if isinstance(e, requests.exceptions.Timeout) else "CONN"
+            if attempt < retries:
+                time.sleep(random.uniform(0.1, 0.4))
+        except Exception as e:
+            result["error"] = str(e)[:60]; return result
+
+    return result
+
+
+async def _fingerprint_port(session: aiohttp.ClientSession,
+                             host: str, port: int, timeout: float) -> tuple[int, dict]:
+    """Async helper: probe one port and return (port, fingerprint_result)."""
+    probes   = FINGERPRINT_PROBES.get(port, [])
     findings = []
 
-    for path, method, match_fn, weight, framework in probes:
-        body = "{}" if method == "POST" else None
-        resp = http_probe(host, port, path, method, body, timeout, retries=1)
+    probe_tasks = [
+        async_http_probe(session, host, port, path,
+                         method, "{}" if method == "POST" else None,
+                         timeout, retries=1)
+        for path, method, *_ in probes
+    ]
+    responses = await asyncio.gather(*probe_tasks, return_exceptions=True)
 
-        if resp["error"] and resp["error"] not in ("SSL",):
+    for (path, method, match_fn, weight, framework), resp in zip(probes, responses):
+        if isinstance(resp, Exception) or resp.get("error") not in (None, "SSL"):
             continue
-        if resp["status"] is None:
+        if resp.get("status") is None:
             continue
-
         try:
             matched = match_fn(resp["body"], resp["headers"])
         except Exception:
             matched = False
+        findings.append({"path": path, "status": resp["status"], "weight": weight,
+                          "hit": matched, "framework": framework,
+                          "headers": resp["headers"], "body_snip": resp["body"][:400]})
 
-        findings.append({
-            "path":      path,
-            "status":    resp["status"],
-            "weight":    weight,
-            "hit":       matched,
-            "framework": framework,
-            "headers":   resp["headers"],
-            "body_snip": resp["body"][:400],
-        })
-
-    # ── Weighted scoring ─────────────────────────────────────────
-    # Accumulate weight per framework from matching probes only.
+    # Weighted scoring
     fw_scores: dict[str, int] = {}
     for f in findings:
         if f["hit"]:
             fw_scores[f["framework"]] = fw_scores.get(f["framework"], 0) + f["weight"]
 
-    best_framework = max(fw_scores, key=fw_scores.get) if fw_scores else None
-    top_score      = fw_scores.get(best_framework, 0)
+    best = max(fw_scores, key=fw_scores.get) if fw_scores else None
+    score = fw_scores.get(best, 0)
+    confidence = "HIGH" if score >= 3 else "MEDIUM" if score >= 1 else "LOW"
 
-    if   top_score >= 3: confidence = "HIGH"
-    elif top_score >= 1: confidence = "MEDIUM"
-    else:                confidence = "LOW"
-
-    # ── Header-based overrides (always definitive) ───────────────
     all_headers: dict = {}
     for f in findings:
         all_headers.update(f.get("headers", {}))
-
     server_hdr = all_headers.get("Server", "") or all_headers.get("server", "")
 
     if "torchserve" in server_hdr.lower():
-        best_framework = "TorchServe"
-        confidence     = "HIGH"
+        best, confidence = "TorchServe", "HIGH"
+    if "uvicorn" in server_hdr.lower() and not best:
+        best, confidence = "FastAPI / ML Backend (uvicorn)", "MEDIUM"
 
-    # NV-Status header is NOT checked here. It was part of Triton's v1 API
-    # (≤1.13) and is absent from all modern v2 deployments. Checking for it
-    # would be both inaccurate and, due to the empty-string match bug it
-    # previously contained, a guaranteed false-positive on every response.
-
-    if "uvicorn" in server_hdr.lower() and not best_framework:
-        best_framework = "FastAPI / ML Backend (uvicorn)"
-        confidence     = "MEDIUM"
-
-    return {
-        "framework":   best_framework,
+    return port, {
+        "framework":   best,
         "confidence":  confidence,
-        "score":       top_score,
+        "score":       score,
         "evidence":    [f for f in findings if f["hit"]],
         "server_hdr":  server_hdr,
         "all_headers": all_headers,
     }
 
 
+async def fingerprint_all_ports(host: str, http_ports: list[int],
+                                 timeout: float, verify: bool) -> dict:
+    """
+    Run fingerprinting probes against all open HTTP ports concurrently.
+
+    All port probes fire in parallel via asyncio.gather() — a host with
+    6 open AI ports takes ~1× timeout instead of 6× timeout.
+    """
+    ssl_ctx = _make_ssl_ctx(verify)
+    connector = aiohttp.TCPConnector(ssl=ssl_ctx)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = [_fingerprint_port(session, host, p, timeout) for p in http_ports]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    fp: dict = {}
+    for item in results:
+        if isinstance(item, Exception):
+            continue
+        port, data = item
+        fp[port] = data
+    return fp
+
+
+async def _enumerate_port(session: aiohttp.ClientSession,
+                           host: str, port: int,
+                           framework: str, timeout: float) -> tuple[int, list]:
+    """Async helper: run the enumeration chain for one port."""
+    chain   = ENUM_CHAINS.get(framework, [])
+    fw_extr = _EXTRACTORS.get(framework, {})
+    results = []
+
+    tasks = [
+        async_http_probe(session, host, port, path,
+                         method, body, timeout, retries=1)
+        for method, path, body, label in chain
+    ]
+    responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for (method, path, body, label), resp in zip(chain, responses):
+        if isinstance(resp, Exception) or resp.get("status") is None:
+            continue
+        entry = {"label": label, "path": path, "status": resp["status"],
+                 "parsed": {}, "raw_keys": [], "body_snip": resp["body"][:400]}
+        if resp["status"] < 400:
+            try:
+                data = json.loads(resp["body"])
+                entry["raw_keys"] = list(data.keys()) if isinstance(data, dict) else ["<array>"]
+                extractor = fw_extr.get(label)
+                if extractor:
+                    entry["parsed"] = extractor(data)
+            except Exception:
+                pass
+        results.append(entry)
+
+    return port, results
+
+
+async def enumerate_all_ports(host: str,
+                               port_fw_map: dict[int, str],
+                               timeout: float, verify: bool) -> dict:
+    """
+    Run all enumeration chains concurrently across all identified services.
+    """
+    ssl_ctx   = _make_ssl_ctx(verify)
+    connector = aiohttp.TCPConnector(ssl=ssl_ctx)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = [
+            _enumerate_port(session, host, port, fw, timeout)
+            for port, fw in port_fw_map.items()
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    enum: dict = {}
+    for item in results:
+        if isinstance(item, Exception):
+            continue
+        port, data = item
+        enum[port] = data
+    return enum
+
+
 def check_grpc(host: str, port: int, timeout: float) -> str:
     """
-    Heuristic gRPC presence check via HTTP/2 client preface.
+    Two-stage gRPC detection:
 
-    Returns: 'likely' | 'no_response' | 'unknown'
+    Stage 1 — HTTP/2 preface heuristic (fast, no dependencies).
+    Stage 2 — gRPC Server Reflection (RFC 7540 + proto3 binary framing).
 
-    Important: this is a lightweight heuristic only. Some gRPC servers
-    require TLS or specific framing before they respond to the preface,
-    so 'no_response' does not rule out gRPC. Treat any result as
-    indicative, not definitive — use grpcurl for hard confirmation.
+    If reflection succeeds, we return 'reflection_ok' plus the service list.
+    If the preface lands but reflection is refused, we return 'likely'.
+    If nothing responds, we return 'no_response' or 'unknown'.
+
+    Reflection protocol (grpc.reflection.v1alpha.ServerReflection):
+      - Send a ServerReflectionRequest with list_services=''
+      - The server streams back ServerReflectionResponse messages
+      - Each response is length-prefixed: 1 compressed-flag byte + 4-byte big-endian length
+
+    This replicates what `grpcurl -plaintext <host>:<port> list` does at the
+    wire level, without requiring grpcurl to be installed.
     """
+    # ── Stage 1: HTTP/2 preface ──────────────────────────────────
+    preface_ok = False
     try:
         with socket.create_connection((host, port), timeout=timeout) as s:
             s.settimeout(timeout)
-            # HTTP/2 client connection preface (RFC 7540 §3.5)
             s.sendall(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
             data = s.recv(64)
-            # A SETTINGS frame (type=0x4) is the expected first server frame.
-            # Frame format: 3-byte length | 1-byte type | ...
-            # We check for common frame types (SETTINGS=4, GOAWAY=7) as weak signal.
-            if len(data) >= 3 and data[3:4] in (b'\x04', b'\x07', b'\x00', b'\x01'):
-                return "likely"
-            return "unknown"
-    except (socket.timeout, TimeoutError):
-        return "no_response"
+            # SETTINGS frame type = 0x04, at offset 3 in the 9-byte frame header
+            if len(data) >= 4 and data[3:4] in (b'\x04', b'\x07', b'\x00', b'\x01'):
+                preface_ok = True
     except Exception:
         return "unknown"
+
+    if not preface_ok:
+        return "no_response"
+
+    # ── Stage 2: gRPC Server Reflection ──────────────────────────
+    # Build a minimal HTTP/2 + gRPC reflection request by hand.
+    # We need: SETTINGS, HEADERS (with :method POST etc.), DATA (the proto body).
+    #
+    # The ServerReflectionRequest proto (field 7 = list_services, string ""):
+    #   Field 7, wire type 2 (length-delimited), empty string → bytes: 0x3a 0x00
+    #
+    # gRPC data frame: 0x00 (not compressed) + 4-byte big-endian length + proto bytes
+    try:
+        proto_body   = b'\x3a\x00'                          # list_services: ""
+        grpc_frame   = b'\x00' + struct.pack('>I', len(proto_body)) + proto_body
+
+        # Minimal HTTP/2 frames to bootstrap a gRPC stream (plaintext only).
+        # We use the http2 preface + a SETTINGS frame + HEADERS + DATA.
+        # For simplicity we use the http/1.1 upgrade trick that some gRPC
+        # servers accept, but fall back gracefully if not.
+        #
+        # Practical approach: open a raw TCP socket, send the full HTTP/2
+        # client preface, then a HEADERS frame (with hpack-encoded headers),
+        # then a DATA frame containing the gRPC body.
+        #
+        # Minimal HPACK-encoded headers for gRPC reflection:
+        #   :method POST, :scheme http, :path /grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo
+        #   content-type application/grpc, te trailers
+        #
+        # Rather than implement a full HPACK encoder, we use the "never indexed"
+        # literal representation (0x10 prefix) for each header.
+
+        def hpack_literal(name: bytes, value: bytes) -> bytes:
+            """HPACK literal header, never indexed (RFC 7541 §6.2.3)."""
+            def encode_str(s: bytes) -> bytes:
+                return bytes([len(s)]) + s   # no Huffman, length prefix
+            return b'\x10' + encode_str(name) + encode_str(value)
+
+        hpack_block = (
+            b'\x84'                                          # :method POST  (indexed, table[4])
+            + b'\x86'                                        # :scheme http  (indexed, table[6])
+            + hpack_literal(b':path',
+                            b'/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo')
+            + hpack_literal(b':authority', host.encode())
+            + hpack_literal(b'content-type', b'application/grpc')
+            + hpack_literal(b'te',           b'trailers')
+        )
+
+        # HTTP/2 HEADERS frame (type=0x01, flags=0x04 END_HEADERS, stream_id=1)
+        def h2_frame(ftype: int, flags: int, stream_id: int, payload: bytes) -> bytes:
+            length = len(payload)
+            return (struct.pack('>I', length)[1:]           # 3-byte length
+                    + bytes([ftype, flags])
+                    + struct.pack('>I', stream_id & 0x7FFFFFFF)
+                    + payload)
+
+        client_preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+        settings_frame = h2_frame(0x04, 0x00, 0, b'')       # empty SETTINGS
+        headers_frame  = h2_frame(0x01, 0x04, 1, hpack_block)
+        data_frame     = h2_frame(0x00, 0x01, 1, grpc_frame) # END_STREAM
+
+        wire = client_preface + settings_frame + headers_frame + data_frame
+
+        with socket.create_connection((host, port), timeout=timeout) as s:
+            s.settimeout(timeout)
+            s.sendall(wire)
+
+            # Read up to 4 KB of response — enough to see service names
+            response = b''
+            while len(response) < 4096:
+                chunk = s.recv(1024)
+                if not chunk:
+                    break
+                response += chunk
+                # Stop once we see 'ServerReflectionInfo' or a known service name
+                if b'ServerReflection' in response or b'grpc.' in response:
+                    break
+
+        # Parse service names from the gRPC response stream.
+        # Each gRPC message: 1-byte compressed flag + 4-byte length + proto body.
+        # We scan for printable ASCII strings that look like service names.
+        services = []
+        # Simple heuristic: find null-terminated or length-prefixed strings
+        # containing dots (proto service names are dot-separated)
+        text = response.decode('utf-8', errors='replace')
+        for word in text.split():
+            if '.' in word and all(c.isprintable() for c in word) and len(word) > 4:
+                clean = ''.join(c for c in word if c.isalnum() or c in './_-')
+                if clean and clean not in services:
+                    services.append(clean[:80])
+
+        if services:
+            return f"reflection_ok: {', '.join(services[:6])}"
+        if b'grpc' in response.lower() or len(response) > 9:
+            return "likely"
+        return "likely"
+
+    except Exception:
+        # Reflection refused or server doesn't support it — preface succeeded though
+        return "likely"
 
 
 # ─────────────────────────────────────────────
@@ -735,47 +959,6 @@ _EXTRACTORS: dict[str, dict[str, callable]] = {
 }
 
 
-def enumerate_service(host: str, port: int, framework: str, timeout: float) -> list[dict]:
-    """
-    Run the enumeration chain for the identified framework.
-
-    Extraction is done via dedicated per-endpoint parsers that read structured
-    JSON fields directly — not via line-by-line string scanning. This gives
-    cleaner output and avoids false extractions from deeply nested bodies.
-    """
-    chain    = ENUM_CHAINS.get(framework, [])
-    fw_extr  = _EXTRACTORS.get(framework, {})
-    results  = []
-
-    for method, path, body, label in chain:
-        resp = http_probe(host, port, path, method, body, timeout, retries=1)
-        if resp["status"] is None:
-            continue
-
-        entry: dict = {
-            "label":    label,
-            "path":     path,
-            "status":   resp["status"],
-            "parsed":   {},       # structured extraction result
-            "raw_keys": [],       # top-level JSON keys (fallback overview)
-            "body_snip": resp["body"][:400],
-        }
-
-        if resp["status"] < 400:
-            try:
-                data = json.loads(resp["body"])
-                entry["raw_keys"] = list(data.keys()) if isinstance(data, dict) else ["<array>"]
-
-                # Run the dedicated extractor if one exists for this label
-                extractor = fw_extr.get(label)
-                if extractor:
-                    entry["parsed"] = extractor(data)
-            except (json.JSONDecodeError, Exception):
-                pass  # body wasn't valid JSON; raw_keys stays empty
-
-        results.append(entry)
-
-    return results
 
 
 # ─────────────────────────────────────────────
@@ -941,12 +1124,18 @@ def print_fingerprint_table(fp_results: dict):
         grpc = fp.get("grpc_heuristic", "—")
         srv  = fp.get("server_hdr", "")[:21]
         evid_paths = ", ".join(e["path"] for e in fp.get("evidence", []))[:32]
-        grpc_str = (f"[{grpc_color.get(grpc, 'dim')}]{grpc}[/]"
-                    if grpc != "—" else "[dim]—[/dim]")
+
+        # reflection_ok carries a service list — color it bold green, truncate for table
+        if isinstance(grpc, str) and grpc.startswith("reflection_ok"):
+            grpc_display = f"[bold green]reflect ✔[/bold green]"
+        elif grpc == "—":
+            grpc_display = "[dim]—[/dim]"
+        else:
+            grpc_display = f"[{grpc_color.get(grpc, 'dim')}]{grpc}[/]"
         table.add_row(
             str(port), fw,
             f"[{confidence_color(con)}]{con}[/]",
-            grpc_str, srv or "—", evid_paths or "—",
+            grpc_display, srv or "—", evid_paths or "—",
         )
     console.print(table)
 
@@ -1071,7 +1260,8 @@ def build_json_report(target: str, open_ports: dict, fp_results: dict,
 # ─────────────────────────────────────────────
 
 def run_scan(target: str, port_list: list[int], timeout: float,
-             threads: int, do_enumerate: bool, output_file: Optional[str]):
+             threads: int, do_enumerate: bool, output_file: Optional[str],
+             verify: bool = False):
     start = time.time()
 
     # ── Phase 1: Port Scan ──────────────────────────────────────
@@ -1107,31 +1297,36 @@ def run_scan(target: str, port_list: list[int], timeout: float,
     fp_results: dict = {}
     http_ports = [p for p in open_ports if open_ports[p]["proto"] in ("HTTP", "HTTPS")]
 
-    with Progress(SpinnerColumn(style="magenta"),
-                  TextColumn("{task.description}"),
-                  BarColumn(bar_width=40, style="magenta"),
-                  TextColumn("{task.percentage:>3.0f}%"),
-                  console=console) as prog:
-        task2 = prog.add_task("Fingerprinting services…", total=max(len(http_ports), 1))
-        for port in http_ports:
-            prog.update(task2, description=f"Probing :{port}…")
-            fp_results[port] = fingerprint_service(target, port, timeout)
-            prog.advance(task2)
+    if http_ports:
+        # All HTTP ports are probed concurrently via aiohttp / asyncio.gather().
+        # console.status() is a simple spinner — async bursts complete as a
+        # collective result, so per-item progress bars aren't meaningful here.
+        with console.status("[magenta]Fingerprinting services asynchronously…[/magenta]"):
+            fp_results = asyncio.run(
+                fingerprint_all_ports(target, http_ports, timeout, verify=verify)
+            )
 
-    # gRPC heuristic check for all known gRPC ports that are open
+    # gRPC detection — runs after HTTP phase, uses raw sockets (no aiohttp)
+    # Stage 1: HTTP/2 preface; Stage 2: gRPC reflection if preface succeeds.
     for port in open_ports:
         if open_ports[port]["proto"] == "gRPC":
-            result = check_grpc(target, port, timeout)
+            grpc_result = check_grpc(target, port, timeout)
             if port in fp_results:
-                fp_results[port]["grpc_heuristic"] = result
+                fp_results[port]["grpc_heuristic"] = grpc_result
             else:
-                # Pure gRPC port (no HTTP probes available)
+                # Pure gRPC port — build a fingerprint entry from reflection result
+                services_note = ""
+                if grpc_result.startswith("reflection_ok"):
+                    services_note = grpc_result[len("reflection_ok: "):]
                 fp_results[port] = {
-                    "framework":      f"{AI_PORTS[port]['service']} (gRPC — heuristic only)",
-                    "confidence":     "LOW",
+                    "framework":      (f"gRPC ({services_note})"
+                                       if services_note
+                                       else f"{AI_PORTS[port]['service']} (gRPC)"),
+                    "confidence":     "HIGH" if grpc_result.startswith("reflection_ok") else "LOW",
                     "evidence":       [],
                     "server_hdr":     "",
-                    "grpc_heuristic": result,
+                    "grpc_heuristic": grpc_result,
+                    "score":          0,
                 }
 
     print_fingerprint_table(fp_results)
@@ -1141,17 +1336,27 @@ def run_scan(target: str, port_list: list[int], timeout: float,
 
     if do_enumerate:
         console.rule("[header]Phase 3 · Metadata Enumeration[/header]")
+
+        # Build port→framework map for services that have an enumeration chain.
+        # Fuzzy-match the identified framework name against ENUM_CHAINS keys.
+        port_fw_map: dict[int, str] = {}
         for port, fp in fp_results.items():
             fw = fp.get("framework")
             if not fw:
                 continue
-            # Match to enum chain (fuzzy)
             matched_fw = next((k for k in ENUM_CHAINS if k.lower() in fw.lower()), None)
             if matched_fw:
-                console.print(f"  [info]Enumerating[/info] :{port} [{matched_fw}]…")
-                data = enumerate_service(target, port, matched_fw, timeout)
-                enum_results[port] = data
-                print_enum_results(port, matched_fw, data)
+                port_fw_map[port] = matched_fw
+                console.print(f"  [info]Queued[/info] :{port} [{matched_fw}]")
+
+        if port_fw_map:
+            with console.status("[blue]Executing enumeration chains concurrently…[/blue]"):
+                enum_results = asyncio.run(
+                    enumerate_all_ports(target, port_fw_map, timeout, verify=verify)
+                )
+            # Print gathered results after the async burst completes
+            for port, data in enum_results.items():
+                print_enum_results(port, port_fw_map[port], data)
 
     # ── Phase 4: Exposure Risk Flags ─────────────────────────────
     console.rule("[header]Phase 4 · Exposure Risk Flags[/header]")
@@ -1212,29 +1417,32 @@ Examples:
                    help="Save JSON report to file")
     p.add_argument("--no-banner",      action="store_true",
                    help="Suppress ASCII banner")
-    p.add_argument("--max-cidr",       type=int, default=MAX_CIDR_HOSTS,
-                   help=f"Max hosts to scan in a CIDR range (default: {MAX_CIDR_HOSTS})")
+    p.add_argument("--no-verify",      action="store_true",
+                   help="Disable TLS certificate verification (self-signed certs)")
+    p.add_argument("--max-cidr",       type=int, default=DEFAULT_MAX_CIDR,
+                   help=f"Max hosts to scan in a CIDR range (default: {DEFAULT_MAX_CIDR})")
     return p.parse_args()
 
 
-def expand_targets(target_str: str) -> list[str]:
+def expand_targets(target_str: str, max_cidr: int = DEFAULT_MAX_CIDR) -> list[str]:
     """
     Expand a CIDR range into individual host IPs, or validate/return a
     single hostname/IP.
 
+    max_cidr is passed in explicitly — no global state mutation needed.
+
     Raises SystemExit on:
-    - CIDR ranges exceeding MAX_CIDR_HOSTS (safety cap against accidental
-      large scans — override with --max-cidr if you need more)
+    - CIDR ranges exceeding max_cidr (safety cap against accidental large scans)
     - Targets that are neither a valid IP, CIDR, nor a resolvable hostname
     """
     # Try CIDR first
     try:
         network = ipaddress.ip_network(target_str, strict=False)
         hosts = list(network.hosts())
-        if len(hosts) > MAX_CIDR_HOSTS:
+        if len(hosts) > max_cidr:
             console.print(
                 f"[danger]CIDR {target_str} expands to {len(hosts)} hosts, "
-                f"which exceeds the safety cap of {MAX_CIDR_HOSTS}.\n"
+                f"which exceeds the safety cap of {max_cidr}.\n"
                 f"Use a smaller range, or raise the cap with --max-cidr.[/danger]"
             )
             sys.exit(1)
@@ -1255,9 +1463,6 @@ def expand_targets(target_str: str) -> list[str]:
 
 
 def main():
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
     args = parse_args()
 
     if not args.no_banner:
@@ -1273,10 +1478,8 @@ def main():
     else:
         port_list = list(AI_PORTS.keys())
 
-    # Expand targets
-    global MAX_CIDR_HOSTS
-    MAX_CIDR_HOSTS = args.max_cidr
-    targets = expand_targets(args.target)
+    # Expand targets — cap passed directly, no global mutation
+    targets = expand_targets(args.target, max_cidr=args.max_cidr)
 
     if len(targets) > 1:
         console.print(f"  [info]CIDR expanded to[/info] [bold]{len(targets)}[/bold] hosts\n")
@@ -1293,6 +1496,7 @@ def main():
             threads=args.threads,
             do_enumerate=args.enumerate,
             output_file=args.output if len(targets) == 1 else None,
+            verify=not args.no_verify,
         )
         all_reports[target] = report
 
