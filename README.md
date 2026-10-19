@@ -1,127 +1,177 @@
-# AI-RECON — AI Infrastructure Reconnaissance Tool
+# AI-RECON
 
-> **Made by Aryan Giri**  
-> Fingerprint · Enumerate · Map the AI Attack Surface
+**AI/ML Infrastructure Reconnaissance · Fingerprint · Enumerate · Map**  
+Made by Aryan Giri · Version **1.4.0**
 
-A purpose-built reconnaissance tool for AI/ML infrastructure — the kind Nmap doesn't understand. Where Nmap sees `http-alt` on port 8000, AI-RECON sees Triton, vLLM, or Ollama, queries their APIs, and maps the full attack surface.
+AI-RECON is a Python-based, evidence-driven reconnaissance tool for discovering AI/ML services across a selected TCP port scope. It combines port scanning with application-level probes so service identification does **not** depend on a service running on its conventional port. It is intended to complement tools such as Nmap, not replace them.
 
----
+> **Authorised use only.** Run it against systems you own, isolated labs, or targets explicitly in scope for an engagement. Even read-only discovery can expose internal model names, registry metadata, notebook names, and infrastructure details.
 
-## Features
+## What changed in v1.4.0
 
-| Phase | What It Does |
-|-------|-------------|
-| **Port Scanning** | Parallel TCP connect scan across 19 AI-specific ports (5000, 6333, 8000–8002, 8080–8082, 8265, 8500–8501, 8888, 9000–9001, 11434, 19530) |
-| **HTTP Fingerprinting** | Header analysis, JSON response structure, endpoint naming conventions, error-message fingerprinting |
-| **gRPC Detection** | HTTP/2 preface probe for Triton (8001), TF Serving (8500), Qdrant (6334), Milvus (19530) |
-| **Metadata Enumeration** | Pulls experiments, model registries, artifact URIs, user IDs from MLflow; collections from Qdrant/Weaviate/Chroma; kernels + notebooks from Jupyter; model lists from Ollama/Triton/TorchServe |
-| **Vulnerability Flags** | Maps findings to known CVEs (CVE-2023-48022, CVE-2024-1558, CVE-2024-28224, ShellTorch, etc.) |
-| **ATLAS Mapping** | Every port finding tagged with its MITRE ATLAS technique ID |
-| **JSON Export** | Full structured report for pipeline integration |
-| **CIDR Support** | Scan entire subnets with one command |
+- **Port-agnostic HTTP/HTTPS fingerprinting:** after finding an open TCP port, the tool tries a likely HTTP scheme and falls back to the other scheme when the connection or response suggests a protocol mismatch. It checks API response shapes, product endpoints, root-page markers, headers, and metrics regardless of conventional service port.
+- **More scan coverage:** choose a smart profile, a broader common-port profile, an all-TCP-port scan, or explicit comma-separated ports and ranges.
+- **Non-HTTP protocol fingerprints:** low-impact banner/protocol checks for SSH, FTP/SMTP banners, MySQL greetings, Redis RESP, PostgreSQL SSL negotiation, TLS/ALPN, and plaintext HTTP/2. HTTP/2 alone is not treated as proof of gRPC or a specific application.
+- **Broader AI/ML discovery:** signatures cover model-serving APIs, OpenAI-compatible endpoints, local-model runtimes, model registries, vector stores, notebooks, metrics, workflow interfaces, and selected AI web UIs where evidence is visible.
+- **Opt-in metadata enumeration:** `--enumerate` runs read-oriented service API queries and extracts compact summaries of models, collections, experiments, registry entries, kernels, checkpoints, or runtime metadata where supported.
+- **More cautious exposure flags:** the scanner reports accessible endpoints as exposure indicators. It does not claim that a CVE is exploitable or that a vulnerable version is present unless separately verified.
+- **Safer transport handling:** redirects are not followed, TLS certificate verification is enabled by default, and common credential-bearing response headers are redacted from reports.
 
----
+## Requirements
 
-## Installation
+- Python 3.10+
+- Dependencies:
 
 ```bash
-pip install requests rich
+python -m pip install aiohttp requests rich
 ```
 
-No other dependencies. Pure Python 3.10+.
+On Windows, use `py -m pip install aiohttp requests rich` if `python` is not the Python launcher on your system.
 
----
-
-## Usage
+## Quick start
 
 ```bash
-# Basic scan — all AI ports against a single host
-python ai_recon.py -t 10.10.45.12
+# Smart profile: AI/ML-related ports plus a curated set of common ports
+python ai_recon.py -t 192.168.1.20
 
-# With full metadata enumeration
-python ai_recon.py -t 10.10.45.12 --enumerate
+# Enumerate supported, exposed metadata endpoints and save a JSON report
+python ai_recon.py -t 192.168.1.20 --enumerate --output report.json
 
-# Save JSON report
-python ai_recon.py -t 10.10.45.12 --enumerate --output report.json
+# Scan explicit ports, including ranges
+python ai_recon.py -t 192.168.1.20 --ports 22,80,443,3000-3100,5000,8000-8100
 
-# Specific ports only
-python ai_recon.py -t 192.168.1.10 --ports 5000,8000,8888
+# Broader scan: TCP ports 1-1024 plus curated AI/common service ports
+python ai_recon.py -t 192.168.1.20 --scan-profile broad
 
-# Scan entire subnet
-python ai_recon.py -t 10.10.45.0/24
+# All TCP ports: slower and noisier; use only with clear authorisation
+python ai_recon.py -t 192.168.1.20 --scan-profile all --timeout 1
 
-# Adjust timing
-python ai_recon.py -t 10.10.45.15 --timeout 5 --threads 100
+# Explicitly disable certificate checks for a lab using self-signed TLS
+python ai_recon.py -t 192.168.1.20 --no-verify
+
+# Scan a small authorised subnet
+python ai_recon.py -t 192.168.1.0/24 --enumerate --output subnet-report.json
 ```
 
----
+`192.168.1.20` and the subnet above are examples. Replace them with an in-scope system or lab target.
 
-## Flags
+## Scan profiles
+
+| Option | Scope | When to use it |
+|---|---|---|
+| `--scan-profile smart` | Default. A curated list of AI/ML ports plus common web, database, container, and service ports. | Fast initial inventory. It can miss services on unusual ports. |
+| `--scan-profile broad` | TCP ports `1-1024`, plus curated AI/common ports outside that range. | Wider discovery without scanning every TCP port. |
+| `--scan-profile all` | TCP ports `1-65535`. | Thorough port coverage when time and scope allow. Expect more traffic and a longer run. |
+| `--ports 3000,5000-5100` | Only the supplied ports/ranges. Overrides the profile. | Targeted scans, unusual deployments, or follow-up checks. |
+
+The smart profile currently scans **about 100 curated ports**; profile contents can change as signatures evolve. A port number is only a hint, never proof of the software listening there. For the broadest port coverage, use `--scan-profile all` or `--ports 1-65535`.
+
+## CLI reference
 
 | Flag | Default | Description |
-|------|---------|-------------|
-| `-t / --target` | required | IP, hostname, or CIDR (e.g. `10.0.0.0/24`) |
-| `-p / --ports` | all AI ports | Comma-separated port list |
-| `--timeout` | 2.0s | TCP/HTTP connection timeout |
-| `--threads` | 50 | Parallel scan threads |
-| `--enumerate` | off | Run metadata enumeration phase |
-| `--output` | off | Write JSON report to file |
-| `--no-banner` | off | Suppress ASCII banner |
+|---|---|---|
+| `-t`, `--target` | Required | IPv4/IPv6 address, hostname, or CIDR range. |
+| `-p`, `--ports` | None | Comma-separated ports/ranges, e.g. `80,443,3000-3100`; accepts `all`. Overrides `--scan-profile`. |
+| `--scan-profile` | `smart` | `smart`, `broad`, or `all`. |
+| `--timeout` | `2.0` seconds | Per-connection/probe timeout. Must be greater than zero. |
+| `--threads` | `50` | Concurrent TCP connection workers. Must be at least one. |
+| `--enumerate` | Off | Run supported read-oriented service metadata queries after fingerprinting. |
+| `--output` | None | Write the JSON report to this path. For a CIDR scan, one combined JSON report is written. |
+| `--no-banner` | Off | Suppress the startup banner. |
+| `--no-verify` | Off | Disable TLS certificate verification. Use only where justified, such as a lab with a self-signed certificate. |
+| `--max-cidr` | `512` hosts | Safety cap for a CIDR expansion. A larger scope requires an explicit higher cap. |
 
----
+## Detection model
 
-## Port Reference
+### 1. TCP discovery
 
-| Port | Service | Category |
-|------|---------|----------|
-| 5000 | MLflow Tracking Server | ML Lifecycle |
-| 6333 | Qdrant HTTP | Vector DB |
-| 6334 | Qdrant gRPC | Vector DB |
-| 8000 | Triton / vLLM / Chroma | Model Serving |
-| 8001 | Triton gRPC | Model Serving |
-| 8002 | Triton Prometheus | Metrics |
-| 8080 | TorchServe / Weaviate | Model Serving |
-| 8081 | TorchServe Management API | Model Serving |
-| 8082 | TorchServe Prometheus | Metrics |
-| 8265 | Ray Dashboard / Job API | Orchestration |
-| 8500 | TensorFlow Serving gRPC | Model Serving |
-| 8501 | TensorFlow Serving HTTP | Model Serving |
-| 8888 | Jupyter Notebook | Dev Environment |
-| 9000 | MinIO S3 API | Object Storage |
-| 9001 | MinIO Console | Object Storage |
-| 11434 | Ollama LLM Runtime | LLM Serving |
-| 19530 | Milvus gRPC | Vector DB |
+A TCP connect scan identifies open ports in the selected range. Known port numbers display **hints**, not confirmed identities. Unrecognised open ports remain in the report and are still fingerprinted.
 
----
+### 2. Application/service fingerprinting
 
-## MITRE ATLAS Mapping
+For each open port, AI-RECON tries the likely HTTP scheme and switches to the other scheme when the connection fails, looks like a protocol mismatch, or redirects to HTTPS. This is independent of the port number, so an HTTP API on a high/custom port can still be fingerprinted. It then evaluates specific evidence, including:
 
-| Finding Type | ATLAS Technique |
-|-------------|----------------|
-| Port scanning AI services | AML.T0006 — Active Scanning |
-| Model registry enumeration | AML.T0007 — Discover ML Artifacts |
-| LLM endpoint identification | AML.T0014 — Discover ML Model Family |
-| Supply chain exposure | AML.T0010 — ML Supply Chain Compromise |
+- Distinctive API paths and response schemas, such as Ollama model tags, OpenAI-compatible model lists, Triton v2 metadata, Qdrant collections, Weaviate schema, Ray version metadata, and MLflow experiment search.
+- Runtime or UI indicators for services such as Text Generation Inference, ComfyUI, Gradio, Streamlit, Open WebUI, LiteLLM, and selected AI workflow interfaces.
+- Service headers and metric-name prefixes where they provide meaningful evidence.
+- TCP protocol behavior and banners if application-level HTTP fingerprinting does not identify the listener.
 
----
+**OpenAI-compatible is an API shape, not a model-engine identity.** vLLM, SGLang, LM Studio, llama.cpp, LocalAI, and other services may expose compatible routes. AI-RECON only names a specific engine when another signal supports that conclusion; otherwise it reports an OpenAI-compatible API.
 
-## JSON Report Structure
+### 3. Optional metadata enumeration
 
-```json
-{
-  "meta": { "tool": "AI-RECON", "author": "Aryan Giri", "target": "...", "timestamp": "..." },
-  "open_ports":    { "5000": { "service": "MLflow", "category": "ML Lifecycle", ... } },
-  "fingerprints":  { "5000": { "framework": "MLflow Tracking", "confidence": "HIGH", ... } },
-  "enumeration":   { "5000": [ { "label": "Experiments", "artifact_uris": [...], "users": [...] } ] },
-  "vulnerabilities": { "5000": [ { "cve": "CVE-2024-1558", "severity": "CRITICAL", ... } ] }
-}
-```
+`--enumerate` sends read-oriented requests only. It does not attempt model inference, create notebooks/kernels, submit Ray jobs, register models, change configuration, or exploit a vulnerability. Some service query APIs use `POST` for search, such as MLflow experiment search; the tool sends an empty search body to that documented read-oriented endpoint.
 
----
+Enumeration depends on API availability, authentication policy, permissions, path prefixes, and software version. A `401`, `403`, `404`, or empty response may prevent metadata retrieval without disproving that a service exists.
+
+### 4. Exposure indicators
+
+The report's `vulnerabilities` object is a set of **risk/exposure indicators**, not a verified vulnerability list. A reachable endpoint does not prove that a historical CVE applies, that the version is vulnerable, or that exploitation is possible. Confirm exact versions, configuration, authentication, and current advisories before treating a finding as a vulnerability.
+
+## Confidence and accuracy notes
+
+Confidence is a heuristic summary of weighted signature evidence:
+
+- **HIGH:** one or more strong, product-specific signatures matched.
+- **MEDIUM:** a useful but less definitive response shape or page marker matched.
+- **LOW:** protocol or generic service evidence only; product identity is not confirmed.
+
+These labels are not statistical probabilities. Reverse proxies, API gateways, WAFs, custom path prefixes, authentication, disabled endpoints, response transformations, and product changes can create false negatives or false positives. A successful TLS handshake identifies TLS, not the application behind it. Plaintext HTTP/2 is only evidence that HTTP/2 is present; gRPC and service reflection are not confirmed by that alone.
+
+TLS verification is enabled by default. With an invalid/self-signed certificate, the tool may identify the TLS listener but not fingerprint its HTTP API. `--no-verify` permits that inspection while weakening certificate validation; reserve it for targets where you understand the trade-off.
+
+HTTP probes are intentionally bounded and redirects are not followed, to avoid sending subsequent requests to an unrelated redirect destination. The `smart` profile is not exhaustive. All-port scans and larger CIDRs can take substantially longer and generate more network traffic.
+
+## JSON report
+
+The report contains:
+
+- `meta`: tool/version, target, timestamp, and scan scope.
+- `open_ports`: open TCP ports and their port-based hints.
+- `fingerprints`: detected service/framework, confidence, evidence paths, response headers (sensitive headers redacted), and protocol/TLS hints where available.
+- `enumeration`: supported endpoint statuses and extracted metadata summaries.
+- `vulnerabilities`: qualified exposure indicators and context for manual verification.
+
+Reports may include internal model names, experiment names/IDs, collection names, artifact URIs, notebook names, and runtime metadata. Store and share them like sensitive security assessment output. Header redaction is not a guarantee that every response body or URI is free of secrets.
+
+## MITRE ATLAS mapping
+
+The port table labels the scan behavior as **AML.T0006 — Active Scanning**. The JSON report also documents contextual links to the current ATLAS sub-techniques **AML.T0006.000 — Enumerate Hosted AI Resources**, **AML.T0006.001 — Query Platform Metadata APIs**, and **AML.T0006.002 — Scan for Exposed AI Infrastructure**. These describe analogous scan activities; they are **context labels, not vulnerability findings or proof of adversary activity**. The former category-to-technique mapping was removed because a product category alone does not justify assigning an adversary technique. The latest release verified for this update is MITRE ATLAS data **2026.09** (released 15 September 2026). Verify current names and IDs on the [official ATLAS site](https://atlas.mitre.org/) before formal reporting.
+
+## Current coverage and limitations
+
+Fingerprints currently target common AI/ML infrastructure patterns, including:
+
+- **Model serving and LLM APIs:** Triton, Ollama, Text Generation Inference, TorchServe, OpenAI-compatible serving, plus signatures that may identify vLLM, llama.cpp, LM Studio, LocalAI, SGLang, and Xinference when visible.
+- **Model lifecycle and orchestration:** MLflow and Ray.
+- **Vector databases:** Qdrant, Weaviate, and Chroma.
+- **Developer/runtime tools:** Jupyter, Gradio, Streamlit, and ComfyUI.
+- **Related AI interfaces and gateways:** LiteLLM, Open WebUI, Flowise, and selected Stable Diffusion WebUI signatures.
+- **Adjacent infrastructure:** MinIO, SSH, common database protocols, TLS, and HTTP/2 hints.
+
+This list is not a guarantee that every version or installation can be identified. For example, TensorFlow Serving's documented REST model-status endpoint requires a model name; AI-RECON does not guess model names just to force a fingerprint. Services hidden behind a reverse proxy or authenticated API may require an in-scope, credentialed assessment to identify fully.
+
+## Research references
+
+The fingerprint and endpoint choices were reviewed against official or project-maintained documentation, including:
+
+- [vLLM OpenAI-compatible server](https://docs.vllm.ai/en/latest/serving/openai_compatible_server/)
+- [llama.cpp server README](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
+- [NVIDIA Triton HTTP/REST and gRPC protocols](https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/protocol/README.html)
+- [Ollama API](https://github.com/ollama/ollama/blob/main/docs/api.md)
+- [MLflow REST API](https://mlflow.org/docs/latest/api_reference/rest-api.html)
+- [Ray Jobs REST API](https://docs.ray.io/en/latest/cluster/running-applications/job-submission/rest.html)
+- [TensorFlow Serving REST API](https://github.com/tensorflow/serving/blob/master/tensorflow_serving/g3doc/api_rest.md)
+- [Qdrant interfaces](https://qdrant.tech/documentation/interfaces/)
+- [Weaviate API](https://docs.weaviate.io/weaviate/api)
+- [Hugging Face Text Generation Inference API](https://huggingface.co/docs/text-generation-inference/en/reference/api_reference)
+- [Chroma API implementation](https://github.com/chroma-core/chroma/blob/main/chromadb/server/fastapi/__init__.py)
+- [Open WebUI API reference](https://docs.openwebui.com/reference/api-endpoints/)
+- [MITRE ATLAS](https://atlas.mitre.org/)
 
 ## Legal
 
-For use in authorised penetration tests, red team engagements, and closed lab environments only.
+Use only on infrastructure you own or are explicitly authorised to assess. The operator is responsible for scope, permission, data handling, and reporting.
 
 ---
 
