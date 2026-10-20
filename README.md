@@ -169,6 +169,38 @@ The fingerprint and endpoint choices were reviewed against official or project-m
 - [Open WebUI API reference](https://docs.openwebui.com/reference/api-endpoints/)
 - [MITRE ATLAS](https://atlas.mitre.org/)
 
+## Contributions and community feedback
+
+AI/ML infrastructure evolves quickly, and keeping fingerprints accurate takes more than one person watching every new project release. Contributions, corrections, and field reports are welcome.
+
+### Help expand AI/ML coverage
+
+Please open an issue to suggest **new tools, utilities, services, and platforms used in modern AI/ML infrastructure**. Examples include model-serving runtimes, inference gateways, agent frameworks, vector databases, model registries, orchestration systems, GPU/runtime management tools, observability stacks, and emerging deployment utilities.
+
+When possible, include:
+
+- **Project name and official documentation/repository**.
+- **What it does** and where it commonly appears in an AI/ML deployment.
+- **Observable indicators** such as documented ports, protocols, headers, routes, response shapes, or version endpoints.
+- **A safe way to verify the fingerprint**, ideally using a local instance, test fixture, or sanitised sample response.
+- **Relevant versions and deployment notes**, including reverse-proxy or custom-port behaviour.
+
+### Report failures and recommend improvements
+
+If AI-RECON misses a service, misidentifies one, produces a false positive, fails to enumerate an expected read-only endpoint, or behaves unexpectedly, please **open an issue**. Recommendations for better accuracy, coverage, performance, output quality, and usability are also useful.
+
+For a useful report, include:
+
+1. AI-RECON version and Python version.
+2. The scan profile or relevant command-line options used. **Remove credentials, tokens, private hostnames/IPs, and other sensitive details before posting.**
+3. Expected behaviour versus actual behaviour.
+4. Sanitised output, error messages, or minimal reproduction steps.
+5. The service/product name and version, if known, plus documentation that supports the expected behaviour.
+
+Please test only against systems you own or are explicitly authorised to assess. Do not attach raw scan reports, secrets, customer data, or private infrastructure details to public issues. If a report may expose a security vulnerability or sensitive information, avoid publishing details publicly and use an appropriate private disclosure channel instead.
+
+Issues are the best place to discuss proposed fingerprints and recommendations before implementation. Pull requests with focused changes, clear evidence, and safe test cases are welcome too. A port number alone is not proof of a service identity; contributions should prefer reproducible evidence and clearly state uncertainty.
+
 ## Legal
 
 Use only on infrastructure you own or are explicitly authorised to assess. The operator is responsible for scope, permission, data handling, and reporting.
